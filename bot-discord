@@ -1,0 +1,169 @@
+import discord
+from discord.ext import commands
+import os
+from dotenv import load_dotenv
+from io import StringIO
+from datetime import datetime
+
+print("🚀 DÉMARRAGE DE LA VERSION FINALE DU BOT")
+
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+guild_configs = {}
+
+async def generate_transcript(channel):
+    messages = [f"{m.created_at.strftime('%Y-%m-%d %H:%M')} - {m.author}: {m.content}"
+                async for m in channel.history(limit=None, oldest_first=True)]
+    return "\n".join(messages)
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"✅ Connecté en tant que {bot.user}")
+
+@bot.tree.command(name="panelsetup", description="Configurer un panneau de ticket sans validation")
+async def panelsetup(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Tu dois être administrateur pour utiliser cette commande.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("🔧 Setup du panneau en cours...", ephemeral=True)
+
+    def check(m): return m.author == interaction.user and m.channel == interaction.channel
+
+    async def ask(prompt):
+        await interaction.followup.send(prompt, ephemeral=True)
+        msg = await bot.wait_for("message", check=check)
+        try: await msg.delete()
+        except: pass
+        return msg
+
+    title = (await ask("1️⃣ Titre de l'embed ?")).content
+    desc = (await ask("2️⃣ Description ?")).content
+    col = (await ask("3️⃣ Couleur ? (bleu, vert, rouge, violet ou hex)")).content.lower()
+
+    colors = {
+        "bleu": discord.Color.blue(),
+        "vert": discord.Color.green(),
+        "rouge": discord.Color.red(),
+        "violet": discord.Color.purple()
+    }
+    color = colors.get(col, discord.Color.blurple())
+
+    label = (await ask("4️⃣ Texte du bouton ?")).content
+    emoji_input = (await ask("5️⃣ Emoji du bouton ? (ou 'non')")).content
+    emoji = emoji_input if emoji_input.lower() != "non" else None
+    prefix = label.lower().replace(" ", "-")
+
+    panel_ch_msg = await ask("6️⃣ Mentionne le salon pour le panneau.")
+    panel_ch = panel_ch_msg.channel_mentions[0]
+
+    log_ch_msg = await ask("7️⃣ Mentionne le salon de logs.")
+    log_ch = log_ch_msg.channel_mentions[0]
+
+    guild_configs[interaction.guild.id] = {
+        "panel_ch": panel_ch.id,
+        "log_ch": log_ch.id,
+        "embed": {"title": title, "desc": desc, "color": color},
+        "button": {"label": label, "emoji": emoji, "prefix": prefix}
+    }
+
+    embed = discord.Embed(title=title, description=desc, color=color)
+    view = discord.ui.View(timeout=None)
+    btn_config = guild_configs[interaction.guild.id]["button"]
+
+    if btn_config["emoji"]:
+        btn = discord.ui.Button(label=btn_config["label"], emoji=btn_config["emoji"])
+    else:
+        btn = discord.ui.Button(label=btn_config["label"])
+
+    async def callback(btn_interaction: discord.Interaction):
+        await btn_interaction.response.send_modal(TicketModal(btn_config["prefix"]))
+
+    btn.callback = callback
+    view.add_item(btn)
+
+    await panel_ch.send(embed=embed, view=view)
+    await interaction.followup.send("✅ Panneau envoyé avec succès.", ephemeral=True)
+
+class TicketModal(discord.ui.Modal, title="Demande de ticket"):
+    raison = discord.ui.TextInput(label="Pourquoi veux-tu ouvrir un ticket ?", max_length=300)
+
+    def __init__(self, prefix):
+        super().__init__()
+        self.prefix = prefix
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user = interaction.user
+        cfg = guild_configs[interaction.guild.id]
+
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(view_channel=True)
+        }
+
+        ch = await interaction.guild.create_text_channel(
+            name=f"ticket-{self.prefix}-{user.name}".lower(),
+            overwrites=overwrites
+        )
+
+        embed = discord.Embed(
+            title="📩 Ticket Ouvert",
+            description=cfg["embed"]["desc"],
+            color=cfg["embed"]["color"]
+        )
+        embed.add_field(name="Raison", value=self.raison.value, inline=False)
+
+        await ch.send(embed=embed, view=TicketActionsView(ch.id))
+        await interaction.response.send_message(f"🎟️ Ticket ouvert : {ch.mention}", ephemeral=True)
+
+class TicketActionsView(discord.ui.View):
+    def __init__(self, channel_id):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="🤚 Claim", style=discord.ButtonStyle.secondary)
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        button.disabled = True
+        await interaction.response.send_message(f"🔒 Ticket pris en charge par {interaction.user.mention}")
+        await interaction.message.edit(view=self)
+
+    @discord.ui.button(label="❌ Fermer", style=discord.ButtonStyle.danger)
+    async def close(self, interaction: discord.Interaction, _):
+        await interaction.response.send_modal(CloseModal(self.channel_id))
+
+class CloseModal(discord.ui.Modal, title="Fermeture du ticket"):
+    raison = discord.ui.TextInput(label="Pourquoi le fermer ?", max_length=300)
+
+    def __init__(self, channel_id):
+        super().__init__()
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cfg = guild_configs[interaction.guild.id]
+        ch = interaction.guild.get_channel(self.channel_id)
+
+        transcript = await generate_transcript(ch)
+        fichier = discord.File(fp=StringIO(transcript), filename="transcript.txt")
+
+        embed = discord.Embed(
+            title="🛑 Ticket fermé",
+            description=f"Fermé par {interaction.user.mention}\nRaison : {self.raison.value}",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text=datetime.now().strftime("Fermé à %H:%M"))
+
+        # Suppression du MP utilisateur
+        try:
+            pass
+        except:
+            pass
+
+        await bot.get_channel(cfg["log_ch"]).send(embed=embed, file=fichier)
+        await ch.delete()
+
+bot.run(TOKEN)
